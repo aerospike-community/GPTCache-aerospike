@@ -8,8 +8,13 @@ jobs:
   build-and-publish-image:
     runs-on: ubuntu-20.04
     steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+      with:
+        egress-policy: audit
+
     - name: Checkout 
-      uses: actions/checkout@master
+      uses: actions/checkout@61b9e3751b92087fd0b06925ba6dd6314e06f089 # master
 
     - name: Get version
       id: get_version
@@ -22,7 +27,7 @@ jobs:
 
     - name: Docker login 
       if: success()
-      uses: azure/docker-login@v1
+      uses: azure/docker-login@83efeb77770c98b620c73055fbb59b2847e17dc0 # v1.0.1
       with:
         username: ${{ secrets.ZILLIZ_DOCKERHUB_USERNAME }} 
         password: ${{ secrets.ZILLIZ_DOCKERHUB_PASSWORD }}
