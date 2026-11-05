@@ -83,6 +83,10 @@ class CacheBase:
                 table_name=table_name,
                 table_len_config=table_len_config,
             )
+        elif name == "aerospike":
+            from gptcache.manager.scalar_data.aerospike_storage import AerospikeStorage
+
+            return AerospikeStorage(**kwargs)
         elif name == "mongo":
             from gptcache.manager.scalar_data.mongo import MongoStorage
 
