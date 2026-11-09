@@ -110,6 +110,10 @@ class VectorBase:
     @staticmethod
     def get(name, **kwargs):
         top_k = kwargs.get("top_k", TOP_K)
+        if name == "aerospike":
+            from gptcache.manager.vector_data.aerospike import AerospikeVectorStore
+
+            return AerospikeVectorStore(**kwargs)
         if name == "milvus":
             from gptcache.manager.vector_data.milvus import Milvus
 
