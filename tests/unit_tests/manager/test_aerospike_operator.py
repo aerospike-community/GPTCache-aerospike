@@ -34,6 +34,65 @@ def read(path):
     return json.loads((path / "receipt.json").read_bytes())
 
 
+@pytest.mark.parametrize("fault", ["receipt_open", "lock_fsync", "receipt_fsync", "directory_fsync"])
+def test_failed_enrollment_can_be_retried_without_adopting_partial_state(
+        tmp_path, monkeypatch, fault):
+    path = tmp_path / "journal"
+    path.mkdir(mode=0o700)
+    original_open, original_fsync = op.os.open, op.os.fsync
+    calls = []
+
+    def open_file(name, *args, **kwargs):
+        if fault == "receipt_open" and name == "receipt.json":
+            raise OSError("receipt creation failed")
+        return original_open(name, *args, **kwargs)
+
+    def fsync(fd):
+        calls.append(fd)
+        if len(calls) == {"lock_fsync": 1, "receipt_fsync": 2, "directory_fsync": 3}.get(fault):
+            raise OSError("enrollment sync failed")
+        original_fsync(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(op.os, "open", open_file)
+        patch.setattr(op.os, "fsync", fsync)
+        with pytest.raises(OSError):
+            op._Journal.enroll(path, MANIFEST)
+    assert list(path.iterdir()) == []
+    op._Journal.enroll(path, MANIFEST)
+    assert op._Journal.status(path) == {
+        "state": "MAINTENANCE", "launch_blocked": True, "sequence": 0}
+
+
+def test_failed_reenrollment_preserves_existing_journal(directory):
+    before = {p.name: p.read_bytes() for p in directory.iterdir()}
+    identities = {p.name: op._identity(p.stat()) for p in directory.iterdir()}
+    with pytest.raises(op.OperatorRefusal, match="JOURNAL_NOT_EMPTY"):
+        op._Journal.enroll(directory, MANIFEST)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == before
+    assert {p.name: op._identity(p.stat()) for p in directory.iterdir()} == identities
+
+
+def test_enrollment_failure_does_not_remove_a_replaced_lock(tmp_path, monkeypatch):
+    path = tmp_path / "journal"
+    path.mkdir(mode=0o700)
+    original = op.os.open
+
+    def open_file(name, *args, **kwargs):
+        if name == "receipt.json":
+            (path / "lock").rename(path / "original-lock")
+            (path / "lock").write_bytes(b"not created by this enrollment")
+            (path / "lock").chmod(0o600)
+            raise OSError("receipt creation failed")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(op.os, "open", open_file)
+    with pytest.raises(op.OperatorRefusal, match="ENROLLMENT_FILE_REPLACED"):
+        op._Journal.enroll(path, MANIFEST)
+    assert (path / "lock").read_bytes() == b"not created by this enrollment"
+    assert (path / "original-lock").exists()
+
+
 class DockerBoundary:
     def __init__(self, directory):
         self.directory = directory
@@ -570,6 +629,25 @@ def resource(path, directory=False):
     return value
 
 
+def test_resource_returns_bytes_from_the_identity_checked_descriptor(tmp_path, monkeypatch):
+    path = tmp_path / "config"
+    path.write_bytes(b"pinned")
+    path.chmod(0o600)
+    pinned = resource(path)
+    original = op._path_fd
+
+    def replace_after_open(name, *args, **kwargs):
+        fd = original(name, *args, **kwargs)
+        if name == str(path) and not path.with_suffix(".old").exists():
+            path.rename(path.with_suffix(".old"))
+            path.write_bytes(b"replacement")
+            path.chmod(0o600)
+        return fd
+
+    monkeypatch.setattr(op, "_path_fd", replace_after_open)
+    assert op._resource(pinned) == b"pinned"
+
+
 class ControllerDocker:
     """OS/Docker command boundary only; all orchestration above is production."""
 
@@ -974,6 +1052,31 @@ def test_pinned_resource_drift(controller, monkeypatch, fault):
     with pytest.raises(op.OperatorRefusal):
         instance.resume_initialization(intent_id="new-cache")
     assert op._Journal.status(journal)["launch_blocked"] is True
+
+
+def test_manifest_validates_the_authenticated_config_bytes_without_reopening(
+        controller, monkeypatch):
+    instance, _, journal, manifest = controller
+    original_bytes, original_config = op._bytes, op._config
+    paths = {item["path"] for item in instance.manifest["configs"].values()}
+    reads, validated = {}, []
+
+    def changing_bytes(path, *args, **kwargs):
+        raw = original_bytes(path, *args, **kwargs)
+        if path in paths:
+            reads[path] = reads.get(path, 0) + 1
+            if reads[path] > 1:
+                return raw.replace(b"filesize 1G", b"filesize 2G")
+        return raw
+
+    def validate(raw, namespace):
+        validated.append(raw)
+        original_config(raw, namespace)
+
+    monkeypatch.setattr(op, "_bytes", changing_bytes)
+    monkeypatch.setattr(op, "_config", validate)
+    op._manifest(manifest, str(journal))
+    assert validated == [CONFIG.encode()]
 
 
 def test_missing_fixed_runtime_actionable_without_journal_mutation(controller, monkeypatch):

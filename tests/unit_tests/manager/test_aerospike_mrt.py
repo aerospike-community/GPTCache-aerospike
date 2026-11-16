@@ -1,4 +1,6 @@
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from unittest.mock import Mock
 
 import pytest
@@ -296,3 +298,67 @@ def test_sc_absent_root_with_orphan_allocator_refuses_initialization(transaction
     assert events == ["begin", "abort"]
     assert all(name not in ("put", "add", "delete_record")
                for builder in session.executed for name, _ in builder.calls)
+
+
+def test_shared_provider_abort_cannot_reset_another_threads_scope_state(transactional):
+    storage, session, module, events = transactional
+    storage._boot, storage._active = None, False
+    entered, release, second_started, committed = Event(), Event(), Event(), Event()
+    boot = "00000000-0000-4000-8000-000000000002"
+
+    def abort():
+        storage._boot, storage._active = "uncommitted", True
+        entered.set()
+        assert release.wait(5)
+        raise module.AerospikeStorageError("abort this transaction")
+
+    def activate():
+        storage._boot, storage._active = boot, True
+        committed.set()
+
+    def concurrent_activation():
+        second_started.set()
+        storage._run_atomic(activate)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(storage._run_atomic, abort)
+        try:
+            assert entered.wait(5)
+            second = executor.submit(concurrent_activation)
+            assert second_started.wait(5)
+            assert not committed.wait(0.1)
+        finally:
+            release.set()
+        with pytest.raises(module.AerospikeStorageError):
+            first.result(timeout=5)
+        second.result(timeout=5)
+    assert (storage._boot, storage._active) == (boot, True)
+    assert events == ["begin", "abort", "begin", "commit"]
+
+
+def test_shared_provider_ready_waits_for_scope_transaction_to_commit(transactional):
+    storage, session, module, events = transactional
+    entered, release, checking, ready = Event(), Event(), Event(), Event()
+
+    def activate():
+        storage._active = True
+        entered.set()
+        assert release.wait(5)
+
+    def check_ready():
+        checking.set()
+        storage._ready()
+        ready.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(storage._run_atomic, activate)
+        try:
+            assert entered.wait(5)
+            second = executor.submit(check_ready)
+            assert checking.wait(5)
+            assert not ready.wait(0.1)
+        finally:
+            release.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+    assert ready.is_set()

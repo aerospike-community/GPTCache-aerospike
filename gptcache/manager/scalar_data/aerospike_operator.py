@@ -116,7 +116,7 @@ class _Journal:
         _require(type(manifest_sha256) is str and
                  re.fullmatch("[0-9a-f]{64}", manifest_sha256), "INVALID_MANIFEST_HASH")
         directory = _directory(path)
-        lock = None
+        lock, receipt = None, None
         try:
             members = os.listdir(directory)
             _require(not members or members == ["runtime"], "JOURNAL_NOT_EMPTY")
@@ -134,12 +134,24 @@ class _Journal:
                      "stop_intents": {}, "stop_proofs": {}}
             receipt = os.open("receipt.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL |
                               os.O_NOFOLLOW, 0o600, dir_fd=directory)
-            with os.fdopen(receipt, "wb") as stream:
+            with os.fdopen(receipt, "wb", closefd=False) as stream:
                 stream.write(_json(state))
                 stream.flush()
                 os.fsync(stream.fileno())
             os.fsync(directory)
+        except BaseException:
+            for name, fd in (("receipt.json", receipt), ("lock", lock)):
+                if fd is not None:
+                    info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    _require(_identity(info) == _identity(os.fstat(fd)),
+                             "ENROLLMENT_FILE_REPLACED")
+                    os.unlink(name, dir_fd=directory)
+            if lock is not None:
+                os.fsync(directory)
+            raise
         finally:
+            if receipt is not None:
+                os.close(receipt)
             if lock is not None:
                 os.close(lock)
             os.close(directory)
@@ -564,15 +576,19 @@ def _path_fd(path, directory=False, metadata=False):
         raise
 
 
+def _fd_bytes(fd, limit=1024 * 1024):
+    with os.fdopen(fd, "rb", closefd=False) as stream:
+        raw = stream.read(limit + 1)
+    _require(len(raw) <= limit, "FILE_TOO_LARGE")
+    return raw
+
+
 def _bytes(path, limit=1024 * 1024, private=False):
     fd = _path_fd(path)
     try:
         if private:
             _private(os.fstat(fd))
-        with os.fdopen(fd, "rb", closefd=False) as stream:
-            raw = stream.read(limit + 1)
-        _require(len(raw) <= limit, "FILE_TOO_LARGE")
-        return raw
+        return _fd_bytes(fd, limit)
     finally:
         os.close(fd)
 
@@ -585,11 +601,13 @@ def _resource(value, directory=False):
     try:
         _require(_identity(os.fstat(fd)) == [value["device"], value["inode"]],
                  "RESOURCE_IDENTITY_CHANGED")
+        if not directory:
+            raw = _fd_bytes(fd)
+            _require(hashlib.sha256(raw).hexdigest() == _sha(value["sha256"]),
+                     "RESOURCE_HASH_CHANGED")
+            return raw
     finally:
         os.close(fd)
-    if not directory:
-        _require(hashlib.sha256(_bytes(value["path"])).hexdigest() ==
-                 _sha(value["sha256"]), "RESOURCE_HASH_CHANGED")
 
 
 def _host_boot():
@@ -676,8 +694,7 @@ def _manifest(path, journal_dir):
     _keys(value["configs"], "public maintenance")
     configs = []
     for mode in ("public", "maintenance"):
-        _resource(value["configs"][mode])
-        configs.append(_bytes(value["configs"][mode]["path"]))
+        configs.append(_resource(value["configs"][mode]))
     # This recipe permits exactly the demonstrated service-address delta.
     public, maintenance = configs
     _config(public, value["namespace"])

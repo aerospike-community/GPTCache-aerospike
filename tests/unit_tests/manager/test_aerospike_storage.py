@@ -398,6 +398,22 @@ class TestLifecycleTracer:
         sdk.connect.assert_called_once_with()
         sdk.cluster.close.assert_called_once_with()
 
+    def test_cleanup_failure_preserves_original_initialization_cause(self, sdk):
+        cause = ValueError("original cause")
+        error = RuntimeError("session failed")
+        cleanup = RuntimeError("cleanup failed")
+
+        def fail(behavior):
+            raise error from cause
+
+        sdk.cluster.create_session.side_effect = fail
+        sdk.cluster.close.side_effect = cleanup
+        with pytest.raises(RuntimeError) as caught:
+            select(sdk)
+        assert caught.value is error
+        assert caught.value.__cause__ is cause
+        assert caught.value.__context__ is cleanup
+
     def test_connect_failure_propagates(self, sdk):
         error = ConnectionError("connect failed")
         sdk.connect.side_effect = error
@@ -792,6 +808,15 @@ def activation(storage, session, **root_changes):
 
 
 class TestLazyActivation:
+    @pytest.mark.parametrize("kind,expected", [
+        ("q", "q"), ("s", "s"), ("r", "r"), ("", "meta"),
+        ("qs", "meta"), ("sr", "meta"), ("qsr", "meta"),
+        ("root", "meta"), ("qid", "meta"),
+    ])
+    def test_dataset_uses_exact_record_kind_membership(self, model, kind, expected):
+        storage, _, _ = model
+        assert storage._dataset(kind).set_name == "gptc_" + expected
+
     def test_selected_constructor_stays_inactive_for_sealed_bootstrap(self, sdk):
         storage = select(sdk)
         try:
@@ -1025,6 +1050,14 @@ class TestModelContract:
         storage._caller.get_settings = lambda *args: replace(original(*args), total_timeout=deadline)
         with pytest.raises(module.AerospikeStorageError, match="deadline|Deadline"):
             storage._check_behavior()
+
+    def test_ready_revalidates_policy_changes_before_record_io(self, model):
+        storage, session, module = model
+        original = storage._caller.get_settings
+        storage._caller.get_settings = lambda *args: replace(original(*args), total_timeout=None)
+        with pytest.raises(module.AerospikeStorageError, match="deadline"):
+            storage.get_ids()
+        assert not session.executed
 
     def test_batch_order_reservation_and_full_input_prevalidation(self, model):
         storage, session, module = model

@@ -18,6 +18,7 @@ import time
 import random
 from importlib import import_module
 from functools import wraps
+from threading import RLock
 from typing import List
 from urllib.parse import unquote, urlparse
 import uuid
@@ -276,6 +277,14 @@ def _atomic(method=None, *, iterable=None):
     return call
 
 
+def _synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class AerospikeStorage(CacheStorage):
     """Own one connected sync cluster and session for an explicit logical scope.
 
@@ -315,6 +324,7 @@ class AerospikeStorage(CacheStorage):
         self._caller = behavior
         self._boot = None
         self._sc = False
+        self._state_lock = RLock()
         self._transaction_session = ContextVar("gptcache_aerospike_transaction", default=None)
         self._cluster = cluster_definition.connect()
         try:
@@ -323,8 +333,8 @@ class AerospikeStorage(CacheStorage):
         except BaseException as exc:
             try:
                 self.close()
-            except BaseException as cleanup_error:
-                raise exc from cleanup_error
+            except BaseException:
+                raise exc
             raise
 
     def _create_session(self):
@@ -335,6 +345,7 @@ class AerospikeStorage(CacheStorage):
         if self._closed:
             raise RuntimeError("Aerospike storage is closed")
 
+    @_synchronized
     def _ready(self):
         self._open()
         if not self._active and self._boot is None:
@@ -534,6 +545,7 @@ class AerospikeStorage(CacheStorage):
                 phase="UNKNOWN_TRANSACTION",
             ) from exc
 
+    @_synchronized
     def _run_atomic(self, operation):
         if not self._sc or self._transaction_session.get() is not None:
             with self._transaction():
@@ -560,7 +572,7 @@ class AerospikeStorage(CacheStorage):
                 time.sleep(delay)
 
     def _dataset(self, kind):
-        return self._sdk.DataSet.of(self.namespace, "gptc_" + (kind if kind in "qsr" else "meta"))
+        return self._sdk.DataSet.of(self.namespace, "gptc_" + (kind if kind in ("q", "s", "r") else "meta"))
 
     def _key(self, kind, identity=None):
         parts = ["gptc", 1, self.cache_scope, kind]
@@ -730,6 +742,7 @@ class AerospikeStorage(CacheStorage):
                 _integer(bins["hi"], 0)
         return bins
 
+    @_synchronized
     def _read(self, kind, identity=None):
         key = self._key(kind, identity)
         row, status = self._point(self._query(key), key)
@@ -747,6 +760,7 @@ class AerospikeStorage(CacheStorage):
                 self._active = False
             raise
 
+    @_synchronized
     def create(self):
         """Create a fresh SC scope atomically, or validate existing scope history."""
         self._open()
@@ -1227,6 +1241,7 @@ class AerospikeStorage(CacheStorage):
             if self._scan(kind):
                 raise AerospikeStorageError("Initialization conflicts with owned data")
 
+    @_synchronized
     def _initialize_scope(self, *, initialization_context, boot, binding, root_attempted):
         """Private settled-runtime primitive; durable intent must precede this call."""
         self._operator_context(initialization_context, "initialize", boot=boot, binding=binding)
@@ -1282,6 +1297,7 @@ class AerospikeStorage(CacheStorage):
             raise AerospikeStorageError("Activation failed or uncertain")
         self.create()
 
+    @_synchronized
     def recover_session_purge(self, qids, *, recovery_context):
         qids = tuple(dict.fromkeys(_id(qid) for qid in qids))
         self._operator_context(recovery_context, "recover", qids, self._boot)
@@ -1318,6 +1334,7 @@ class AerospikeStorage(CacheStorage):
         self._operator_context(recovery_context, "complete", qids, self._boot)
         return outcomes
 
+    @_synchronized
     def close(self):
         if not self._closed:
             self._closed = True
